@@ -1,22 +1,33 @@
 import os
 import shutil
-import tempfile
 import sounddevice as sd
 import numpy as np
 import torch
 import whisper
+from datetime import datetime
+from scipy.io.wavfile import write
 
 # Configurações
 CHUNK_DURATION = 5  # duração de cada chunk em segundos
 
-# Criar pasta temporária para os chunks
+# Criar pastas
 temp_dir = ".temp"
+transcription_dir = "transcricoes"
 os.makedirs(temp_dir, exist_ok=True)
+os.makedirs(transcription_dir, exist_ok=True)
 
 # Input para nome do arquivo
-md_filename = input("📄 Digite o nome do arquivo Markdown para a transcrição (ex: transcricao.md): ")
-if not md_filename.endswith(".md"):
+md_filename = input("📄 Digite o nome do arquivo Markdown para a transcrição (ex: transcricao.md). "
+                    "Se deixar em branco será gerado automaticamente: ").strip()
+
+if not md_filename:
+    # Nome automático baseado na data e hora
+    md_filename = datetime.now().strftime("transcricao-%Y-%m-%d-%Hh%Mm.md")
+elif not md_filename.endswith(".md"):
     md_filename += ".md"
+
+# Caminho final dentro da pasta "transcricoes"
+md_path = os.path.join(transcription_dir, md_filename)
 
 # Listar dispositivos de entrada
 print("\nDispositivos de entrada disponíveis:\n")
@@ -47,7 +58,7 @@ def record_chunk():
     return audio.flatten()
 
 # Abrir arquivo Markdown para salvar transcrição
-with open(md_filename, "w", encoding="utf-8") as md_file:
+with open(md_path, "w", encoding="utf-8") as md_file:
     print("▶️ Iniciando transcrição em tempo real (Ctrl+C para parar)")
     try:
         while True:
@@ -56,8 +67,6 @@ with open(md_filename, "w", encoding="utf-8") as md_file:
 
             # Salvar temporariamente
             temp_path = os.path.join(temp_dir, "chunk.wav")
-            # Salvar usando scipy.io.wavfile
-            from scipy.io.wavfile import write
             write(temp_path, SAMPLE_RATE, (chunk * 32767).astype(np.int16))
 
             # Carregar áudio para Whisper
@@ -66,10 +75,11 @@ with open(md_filename, "w", encoding="utf-8") as md_file:
             if text:
                 print(text)
                 md_file.write(text + "\n")
+                md_file.flush()  # força salvar no disco a cada chunk
 
     except KeyboardInterrupt:
         print("\n✅ Transcrição finalizada.")
 
 # Limpar arquivos temporários
 shutil.rmtree(temp_dir)
-print(f"✅ Arquivos temporários removidos. Transcrição salva em: {md_filename}")
+print(f"✅ Arquivos temporários removidos. Transcrição salva em: {md_path}")
