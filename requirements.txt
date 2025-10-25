@@ -7,4 +7,5 @@ numpy
 whisper
 scipy
 pyannote.audio
+dotenv
 shutil; python_version >= '3.4'

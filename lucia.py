@@ -1,4 +1,5 @@
 #!/home/daviribeiro/projects/personal/lucia/venv/bin/python
+import dotenv
 
 import os
 import sys
@@ -17,12 +18,15 @@ from transformers import pipeline  # sumarização
 # -------------------------------
 # Configurações Globais
 # -------------------------------
+
+dotenv.load_dotenv()
+
 CHUNK_DURATION = 20        # segundos por chunk de gravação
 TRANSCRIPTION_DIR = "/home/daviribeiro/Documents/obsidian-storage/davi-brain/transcricoes"
 TEMP_DIR = ".temp"
 MODEL_NAME = "medium" 
 LANGUAGE = "pt"
-HF_TOKEN = "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"
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Criar diretórios se não existirem
 os.makedirs(TRANSCRIPTION_DIR, exist_ok=True)
