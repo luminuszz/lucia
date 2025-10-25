@@ -1,0 +1,10 @@
+# Requisitos para os scripts edmundo.py e lucia.py
+sentence-transformers
+llama-cpp-python
+torch
+sounddevice
+numpy
+whisper
+scipy
+pyannote.audio
+shutil; python_version >= '3.4'

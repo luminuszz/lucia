@@ -1,3 +1,5 @@
+#!/home/daviribeiro/projects/personal/lucia/venv/bin/python
+
 import os
 from pathlib import Path
 from sentence_transformers import SentenceTransformer, util
@@ -5,8 +7,8 @@ from llama_cpp import Llama
 import torch
 
 # === CONFIGURAÇÕES ===
-TRANSCRIPTIONS_DIR = "./transcricoes"
-LLM_MODEL_PATH = "./models/guanaco-7b-uncensored.Q4_K_M.gguf"
+TRANSCRIPTIONS_DIR = "/home/daviribeiro/projects/personal/lucia/transcricoes"
+LLM_MODEL_PATH = "/home/daviribeiro/projects/personal/lucia/models/guanaco-7b-uncensored.Q4_K_M.gguf"
 TOP_K = 5
 MAX_CONTEXT_TOKENS = 1500
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
