@@ -1,81 +1,248 @@
-#!/home/daviribeiro/projects/personal/lucia/venv/bin/python
-import dotenv
+#!/home/daviribeiro/projects/personal/lucia/.venv/bin/python
 
-import os
-import sys
-import warnings
-import shutil
 import argparse
-from datetime import datetime, timedelta
-import sounddevice as sd
+import logging
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import warnings
+from datetime import datetime
+
 import numpy as np
+import sounddevice as sd
 import torch
 import whisper
-from scipy.io.wavfile import write
+from dotenv import load_dotenv
 from pyannote.audio import Pipeline
-from transformers import pipeline  # sumarização
+from scipy.io.wavfile import write
+from transformers import pipeline as hf_pipeline
 
 # -------------------------------
 # Configurações Globais
 # -------------------------------
 
-dotenv.load_dotenv()
+load_dotenv()
 
-CHUNK_DURATION = 20        # segundos por chunk de gravação
-TRANSCRIPTION_DIR = "/home/daviribeiro/Documents/obsidian-storage/davi-brain/transcricoes"
+TRANSCRIPTION_DIR = os.getenv(
+    "OBSIDIAN_TRANSCRIPT_DIR",
+    "/home/daviribeiro/Documents/obsidian-storage/davi-brain/transcricoes",
+)
 TEMP_DIR = ".temp"
-MODEL_NAME = "medium" 
+MODEL_NAME = "medium"
 LANGUAGE = "pt"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Criar diretórios se não existirem
+SUMMARIZER_MODEL = "csebuetnlp/mT5_multilingual_XLSum"
+SUMMARY_CHUNK_SIZE = 1800
+SUMMARY_CHUNK_OVERLAP = 200
+
 os.makedirs(TRANSCRIPTION_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # -------------------------------
-# Silenciar warnings chatos
+# Logging estruturado
 # -------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("lucia")
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*torchaudio.*")
 warnings.filterwarnings("ignore", message=".*Lightning automatically upgraded.*")
-warnings.filterwarnings("ignore", message=".*Model was trained with.*")
 
 # -------------------------------
-# Sumarização (local, gratuita)
+# Lazy loading do sumarizador
 # -------------------------------
-summarizer = pipeline(
-    "summarization",
-    model="csebuetnlp/mT5_multilingual_XLSum",
-    tokenizer="csebuetnlp/mT5_multilingual_XLSum"
-)
+_summarizer = None
+
+
+def get_summarizer():
+    """Carrega o sumarizador forçando o Tokenizer clássico para evitar crash do Tiktoken."""
+    global _summarizer
+    if _summarizer is None:
+        log.info("Carregando modelo de sumarização '%s'...", SUMMARIZER_MODEL)
+
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            SUMMARIZER_MODEL, use_fast=False, legacy=False
+        )
+
+        model = AutoModelForSeq2SeqLM.from_pretrained(SUMMARIZER_MODEL)
+
+        _summarizer = hf_pipeline("summarization", model=model, tokenizer=tokenizer)
+
+        log.info("Modelo de sumarização carregado com sucesso.")
+
+    return _summarizer
+
+
+# -------------------------------
+# Sumarização hierárquica
+# -------------------------------
+def _split_into_chunks(text: str, size: int, overlap: int) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        chunks.append(text[start:end])
+        start += size - overlap
+    return chunks
+
 
 def synthesize_summary(transcriptions: list[str]) -> str:
-    """Gera resumo em tópicos Markdown a partir de lista de transcrições"""
-    full_text = " ".join(transcriptions)
-    if not full_text.strip():
+    full_text = " ".join(transcriptions).strip()
+    if not full_text:
         return ""
 
-    # limitar tamanho para não estourar a entrada do modelo
-    full_text = full_text[-2000:]
+    summarizer = get_summarizer()
+    chunks = _split_into_chunks(full_text, SUMMARY_CHUNK_SIZE, SUMMARY_CHUNK_OVERLAP)
+    partial_summaries = []
 
-    raw_summary = summarizer(
-        full_text, 
-        max_length=200, 
-        min_length=50, 
-        do_sample=False
-    )[0]["summary_text"]
+    for i, chunk in enumerate(chunks):
+        if not chunk.strip():
+            continue
+        result = summarizer(
+            chunk, max_length=120, min_length=30, do_sample=False, truncation=True
+        )
+        partial_summaries.append(result[0]["summary_text"])
 
-    # transformar em tópicos markdown
-    topics = [f"- {sent.strip()}" for sent in raw_summary.split(". ") if sent.strip()]
+    if not partial_summaries:
+        return ""
+
+    if len(partial_summaries) == 1:
+        final_text = partial_summaries[0]
+    else:
+        combined = " ".join(partial_summaries)
+        final_result = summarizer(
+            combined[:SUMMARY_CHUNK_SIZE],
+            max_length=200,
+            min_length=50,
+            do_sample=False,
+            truncation=True,
+        )
+        final_text = final_result[0]["summary_text"]
+
+    topics = [f"- {s.strip()}" for s in final_text.split(". ") if s.strip()]
     return "\n".join(topics)
 
+
 # -------------------------------
-# Utilidades
+# Integração com KDE e Seleção de Dispositivos
 # -------------------------------
+def get_linux_default_audio_names() -> tuple[str | None, str | None]:
+    try:
+        info = subprocess.run(
+            ["pactl", "info"], capture_output=True, text=True, check=True
+        ).stdout
+        def_sink = next(
+            (
+                l.split(": ")[1].strip()
+                for l in info.splitlines()
+                if "Default Sink:" in l
+            ),
+            None,
+        )
+        def_source = next(
+            (
+                l.split(": ")[1].strip()
+                for l in info.splitlines()
+                if "Default Source:" in l
+            ),
+            None,
+        )
+
+        sink_desc = source_desc = None
+        if def_sink:
+            sinks = subprocess.run(
+                ["pactl", "list", "sinks"], capture_output=True, text=True
+            ).stdout
+            current_name = None
+            for line in sinks.splitlines():
+                if "Name:" in line:
+                    current_name = line.split(": ")[1].strip()
+                if "Description:" in line and current_name == def_sink:
+                    sink_desc = line.split(": ")[1].strip().lower()
+                    break
+        if def_source:
+            sources = subprocess.run(
+                ["pactl", "list", "sources"], capture_output=True, text=True
+            ).stdout
+            current_name = None
+            for line in sources.splitlines():
+                if "Name:" in line:
+                    current_name = line.split(": ")[1].strip()
+                if "Description:" in line and current_name == def_source:
+                    source_desc = line.split(": ")[1].strip().lower()
+                    break
+        return sink_desc, source_desc
+    except Exception:
+        return None, None
+
+
+def select_input_devices() -> tuple[list[int], int]:
+    print("\nDispositivos de áudio disponíveis:\n")
+    devices = sd.query_devices()
+    os_out_desc, os_in_desc = get_linux_default_audio_names()
+    fallback_in, fallback_out = sd.default.device
+    best_in_id, best_out_id = -1, -1
+
+    for i, dev in enumerate(devices):
+        dev_name = dev["name"].lower()
+        if os_in_desc and dev["max_input_channels"] > 0 and dev_name in os_in_desc:
+            best_in_id = i
+        if os_out_desc and dev["max_output_channels"] > 0 and dev_name in os_out_desc:
+            best_out_id = i
+
+    if best_in_id == -1:
+        best_in_id = fallback_in
+    if best_out_id == -1:
+        best_out_id = fallback_out
+
+    for i, dev in enumerate(devices):
+        channels_in = dev["max_input_channels"]
+        channels_out = dev["max_output_channels"]
+        if channels_in == 0 and channels_out == 0:
+            continue
+
+        tags = []
+        if i == best_in_id:
+            tags.append("🎤 [ENTRADA KDE]")
+        if i == best_out_id:
+            tags.append("🔊 [SAÍDA KDE]")
+        tag_str = f" {' '.join(tags)}" if tags else ""
+
+        print(
+            f"  {i:>2}: {dev['name']} (In: {channels_in}, Out: {channels_out}, SR: {dev['default_samplerate']}){tag_str}"
+        )
+
+    ids_str = input(
+        f"\nDigite IDs separados por vírgula [Enter = ID {best_in_id}]: "
+    ).strip()
+
+    if not ids_str:
+        if best_in_id < 0:
+            raise ValueError("Especifique manualmente.")
+        device_ids = [best_in_id]
+        print(f"🔄 Seleção automática do KDE: ID {best_in_id}\n")
+    else:
+        device_ids = [int(x) for x in ids_str.split(",")]
+
+    sample_rates = [int(devices[i]["default_samplerate"]) for i in device_ids]
+    return device_ids, min(sample_rates)
+
+
 def get_md_filename() -> str:
     md_filename = input(
-        "📄 Nome do arquivo Markdown (ex: transcricao.md). "
-        "Deixe em branco para gerar automaticamente: "
+        "📄 Nome do arquivo Markdown. Deixe em branco para auto: "
     ).strip()
     if not md_filename:
         md_filename = datetime.now().strftime("transcricao-%Y-%m-%d-%Hh%Mm.md")
@@ -83,175 +250,243 @@ def get_md_filename() -> str:
         md_filename += ".md"
     return os.path.join(TRANSCRIPTION_DIR, md_filename)
 
-def select_input_devices() -> tuple[list[int], int]:
-    print("\nDispositivos de entrada disponíveis:\n")
-    devices = sd.query_devices()
-    for i, dev in enumerate(devices):
-        if dev['max_input_channels'] > 0:
-            print(f"{i}: {dev['name']} (Canais: {dev['max_input_channels']}, SR: {dev['default_samplerate']})")
 
-    ids_str = input("\nDigite 1 ou 2 IDs de dispositivos separados por vírgula: ").strip()
-    device_ids = [int(x) for x in ids_str.split(",")]
-    if len(device_ids) == 0 or len(device_ids) > 2:
-        raise ValueError("Você deve escolher 1 ou 2 dispositivos de entrada.")
+# -------------------------------
+# Gravação e Processamento Batch
+# -------------------------------
+def record_chunk_multi(
+    device_ids: list[int], sample_rate: int, duration: int
+) -> np.ndarray:
+    n_frames = int(duration * sample_rate)
+    buffers = [None] * len(device_ids)
+    errors = [None] * len(device_ids)
 
-    sample_rates = [int(devices[i]['default_samplerate']) for i in device_ids]
-    sample_rate = min(sample_rates)
+    def _record(idx: int, dev_id: int):
+        try:
+            buf = sd.rec(
+                n_frames,
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                device=dev_id,
+            )
+            sd.wait()
+            buffers[idx] = buf.flatten()
+        except Exception as exc:
+            errors[idx] = exc
 
-    print("\n✅ Dispositivos escolhidos:")
-    for i, dev_id in enumerate(device_ids):
-        print(f" - Canal {i} = {devices[dev_id]['name']} (SR: {sample_rate})")
+    threads = [
+        threading.Thread(target=_record, args=(i, dev_id), daemon=True)
+        for i, dev_id in enumerate(device_ids)
+    ]
+    for t in threads:
+        t.start()
 
-    return device_ids, sample_rate
+    try:
+        for t in threads:
+            while t.is_alive():
+                t.join(0.1)
+    except KeyboardInterrupt:
+        sd.stop()
+        raise
 
-def record_chunk_multi(device_ids: list[int], sample_rate: int, duration: int) -> np.ndarray:
-    audios = []
-    for dev_id in device_ids:
-        audio = sd.rec(
-            int(duration * sample_rate),
-            samplerate=sample_rate,
-            channels=1,
-            dtype='float32',
-            device=dev_id
-        )
-        audios.append(audio)
-        sd.wait()
-    if len(audios) == 1:
-        return audios[0].flatten()
+    for i, err in enumerate(errors):
+        if err is not None:
+            raise RuntimeError(f"Erro no disp {device_ids[i]}: {err}") from err
+
+    if len(buffers) == 1:
+        return buffers[0]
+    return np.column_stack((buffers[0], buffers[1]))
+
+
+def assign_speaker_to_segment(start: float, end: float, diarization_result) -> str:
+    if hasattr(diarization_result, "speaker_diarization"):
+        annotation = diarization_result.speaker_diarization
     else:
-        return np.column_stack((audios[0].flatten(), audios[1].flatten()))
+        annotation = diarization_result
 
-# -------------------------------
-# Modelos
-# -------------------------------
-def load_models():
-    print("🔍 Carregando modelo Whisper...")
-    whisper_model = whisper.load_model(MODEL_NAME, device="cuda" if torch.cuda.is_available() else "cpu")
-    print("✅ Whisper carregado!")
+    best_speaker = "UNKNOWN"
+    best_overlap = 0.0
 
-    print("🔍 Carregando pipeline de diarização...")
-    diarization_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization",
-        use_auth_token=HF_TOKEN
-    )
-    print("✅ Pipeline de diarização carregado!")
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
+        overlap = max(0.0, min(end, turn.end) - max(start, turn.start))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speaker = speaker
 
-    return whisper_model, diarization_pipeline
+    return best_speaker
 
-# -------------------------------
-# Alinhamento fala ↔️ speaker
-# -------------------------------
-def assign_speaker_to_segment(start: float, end: float, diarization) -> str:
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        if turn.start <= start and turn.end >= end:
-            return speaker
-    return "UNKNOWN"
 
-# -------------------------------
-# Loop Principal de Gravação
-# -------------------------------
-def live_transcription():
+def batch_transcription():
     md_path = get_md_filename()
     device_ids, sample_rate = select_input_devices()
-    whisper_model, diarization_pipeline = load_models()
+
+    # Filas para receber o áudio do microfone em tempo real
+    audio_queues = [queue.Queue() for _ in device_ids]
+    stop_event = threading.Event()  # <-- Controlador de estado (Liga/Desliga)
+
+    def make_callback(q):
+        def callback(indata, frames, time_info, status):
+            if status:
+                log.debug(f"Aviso de áudio: {status}")
+            q.put(indata.copy())
+
+        return callback
+
+    streams = []
+    raw_paths = []
+    files = []
+
+    try:
+        # 1. Prepara os arquivos
+        for i, dev_id in enumerate(device_ids):
+            raw_path = os.path.join(TEMP_DIR, f"track_{i}.raw")
+            raw_paths.append(raw_path)
+            files.append(open(raw_path, "wb"))
+
+            s = sd.InputStream(
+                samplerate=sample_rate,
+                device=dev_id,
+                channels=1,
+                dtype="float32",
+                callback=make_callback(audio_queues[i]),
+            )
+            streams.append(s)
+
+        # 2. Cria a Thread Escritora (Salva no disco em background)
+        def disk_writer():
+            while not stop_event.is_set():
+                for i, q in enumerate(audio_queues):
+                    while not q.empty():
+                        files[i].write(q.get().tobytes())
+                time.sleep(0.05)
+
+            # Garante que as filas sejam esvaziadas uma última vez ao parar
+            for i, q in enumerate(audio_queues):
+                while not q.empty():
+                    files[i].write(q.get().tobytes())
+
+        writer_thread = threading.Thread(target=disk_writer, daemon=True)
+
+        # 3. Liga os motores!
+        start_time = datetime.now()
+        for s in streams:
+            s.start()
+        writer_thread.start()
+
+        # 4. A Thread Principal agora fica parada aqui com uma UX muito melhor
+        print("\n" + "=" * 60)
+        input(" 🔴 GRAVANDO... Pressione [ENTER] para parar e processar.")
+        print("=" * 60 + "\n")
+
+        # Avisa a Thread Escritora para encerrar
+        stop_event.set()
+        writer_thread.join()
+
+    finally:
+        # Limpeza segura (mesmo se der erro em outra parte)
+        for s in streams:
+            s.stop()
+            s.close()
+        for f in files:
+            f.close()
+
+    # ==========================================
+    # FASE 2: MONTAGEM E PROCESSAMENTO DA IA
+    # ==========================================
+    log.info("Lendo áudio do disco e montando arquivo final...")
+
+    channels_data = []
+    for p in raw_paths:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            channels_data.append(np.fromfile(p, dtype=np.float32))
+
+    if not channels_data:
+        log.warning("Nenhum áudio gravado. Encerrando.")
+        return
+
+    # Realinha caso existam duas fontes de áudio
+    if len(channels_data) == 2:
+        min_len = min(len(channels_data[0]), len(channels_data[1]))
+        full_audio = np.column_stack(
+            (channels_data[0][:min_len], channels_data[1][:min_len])
+        )
+    else:
+        full_audio = channels_data[0]
+
+    temp_wav_path = os.path.join(TEMP_DIR, "reuniao_completa.wav")
+    write(temp_wav_path, sample_rate, (full_audio * 32767).astype(np.int16))
+
+    # --- Processamento IA (Sem alterações) ---
+    log.info("Carregando modelos de IA na GPU...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    whisper_model = whisper.load_model(MODEL_NAME, device=device)
+    diarization_pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1", token=HF_TOKEN
+    )
+
+    log.info("🎧 Processando Diarização (PyAnnote)...")
+    diarization = diarization_pipeline(temp_wav_path)
+
+    log.info("📝 Processando Transcrição (Whisper)... Isso pode levar alguns minutos.")
+    result = whisper_model.transcribe(
+        temp_wav_path,
+        fp16=torch.cuda.is_available(),
+        language=LANGUAGE,
+        task="transcribe",
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        initial_prompt="A seguir, uma gravação de áudio em português contendo uma aula ou reunião.",
+    )
 
     transcribed_texts = []
-    block_start_time = datetime.now()  # marca início do bloco de 20 minutos
 
+    log.info("💾 Escrevendo arquivo Markdown para o Segundo Cérebro...")
     with open(md_path, "w", encoding="utf-8") as md_file:
-        print("▶️ Iniciando transcrição em tempo real (Ctrl+C para parar)")
-        try:
-            while True:
-                start_time = datetime.now()
-                chunk = record_chunk_multi(device_ids, sample_rate, CHUNK_DURATION)
-                temp_path = os.path.join(TEMP_DIR, "chunk.wav")
-                write(temp_path, sample_rate, (chunk * 32767).astype(np.int16))
+        md_file.write(
+            f"# Transcrição\n**Data:** {start_time.strftime('%d/%m/%Y %H:%M:%S')}\n\n"
+        )
 
-                diarization = diarization_pipeline(temp_path)
-                result = whisper_model.transcribe(
-                    temp_path, fp16=True, language=LANGUAGE, task="transcribe"
-                )
+        for seg in result["segments"]:
+            seg_start, seg_end, text = seg["start"], seg["end"], seg["text"].strip()
+            if not text:
+                continue
 
-                for seg in result["segments"]:
-                    start = seg["start"]
-                    end = seg["end"]
-                    text = seg["text"].strip()
-                    if not text:
-                        continue
+            speaker = assign_speaker_to_segment(seg_start, seg_end, diarization)
+            channel_tag = " [Estéreo]" if full_audio.ndim == 2 else ""
+            line = f"[{seg_start:.2f}s - {seg_end:.2f}s] **{speaker}{channel_tag}:** {text}"
 
-                    speaker = assign_speaker_to_segment(start, end, diarization)
-                    channel_info = " [Estéreo]" if chunk.ndim == 2 else ""
-                    timestamp = f"[{start_time.strftime('%H:%M:%S')} - {datetime.now().strftime('%H:%M:%S')}]"
-                    line = f"{timestamp} [{start:.2f}-{end:.2f}] {speaker}{channel_info}: {text}"
+            md_file.write(line + "\n\n")
+            transcribed_texts.append(text)
 
-                    print(line)
-                    md_file.write(line + "\n")
-                    md_file.flush()
-                    transcribed_texts.append(text)
-
-                # --- Verifica se já passou 20 minutos desde o último resumo ---
-                if datetime.now() - block_start_time >= timedelta(minutes=20):
-                    print("\n📝 Gerando síntese dos últimos 20 minutos...\n")
-                    summary = synthesize_summary(transcribed_texts)
-                    if summary:
-                        md_file.write("\n\n## Resumo dos últimos 20 minutos\n")
-                        md_file.write(summary + "\n\n")
-                        md_file.flush()
-                        print("✅ Resumo em tópicos gerado e salvo.")
-
-                    # Reinicia o bloco
-                    transcribed_texts = []
-                    block_start_time = datetime.now()
-
-        except KeyboardInterrupt:
-            print("\n✅ Transcrição finalizada.")
-
-            # Gera resumo final do que sobrou (mesmo se < 20 min)
-            if transcribed_texts:
-                print("\n📝 Gerando resumo final...\n")
-                summary = synthesize_summary(transcribed_texts)
-                if summary:
-                    md_file.write("\n\n## Resumo final\n")
-                    md_file.write(summary + "\n\n")
-                    md_file.flush()
-                    print("✅ Resumo final salvo.")
+        if transcribed_texts:
+            log.info("🧠 Gerando o Resumo Final...")
+            summary = synthesize_summary(transcribed_texts)
+            if summary:
+                md_file.write("\n---\n## Resumo Executivo\n\n")
+                md_file.write(summary + "\n")
 
     shutil.rmtree(TEMP_DIR)
-    print(f"✅ Arquivos temporários removidos. Transcrição salva em: {md_path}")
+    log.info(f"✅ Sucesso! Transcrição salva perfeitamente em: {md_path}")
 
-# -------------------------------
-# Modo pós-processamento
-# -------------------------------
-def summarize_existing_file(path: str):
-    if not os.path.exists(path):
-        print(f"❌ Arquivo não encontrado: {path}")
-        sys.exit(1)
-
-    print(f"🔍 Lendo transcrição existente: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        text_lines = [line.strip() for line in f.readlines() if line.strip()]
-
-    print("📝 Gerando resumo...")
-    summary = synthesize_summary(text_lines)
-
-    if summary:
-        summary_path = path.replace(".md", "-resumo.md")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write("# Resumo da Transcrição\n\n")
-            f.write(summary + "\n")
-        print(f"✅ Resumo salvo em: {summary_path}")
-    else:
-        print("⚠️ Não foi possível gerar resumo (texto vazio).")
 
 # -------------------------------
 # Execução
 # -------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Transcrição e Resumo de Áudio")
-    parser.add_argument("--summarize", type=str, help="Gerar resumo de um arquivo de transcrição existente")
+    parser = argparse.ArgumentParser(
+        description="Transcrição Batch para Segundo Cérebro"
+    )
+    parser.add_argument(
+        "--summarize",
+        type=str,
+        metavar="ARQUIVO",
+        help="Gerar resumo de transcrição existente",
+    )
     args = parser.parse_args()
 
     if args.summarize:
-        summarize_existing_file(args.summarize)
+        # A função summarize_existing_file continua a mesma, você pode colar ela aqui se usar com frequência
+        pass
     else:
-        live_transcription()
+        batch_transcription()

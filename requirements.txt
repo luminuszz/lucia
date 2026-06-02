@@ -4,8 +4,8 @@ llama-cpp-python
 torch
 sounddevice
 numpy
-whisper
+openai-whisper
 scipy
 pyannote.audio
-dotenv
-shutil; python_version >= '3.4'
+python-dotenv
+transformers<5.0.0
