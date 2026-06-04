@@ -459,13 +459,6 @@ def batch_transcription():
             md_file.write(line + "\n\n")
             transcribed_texts.append(text)
 
-        if transcribed_texts:
-            log.info("🧠 Gerando o Resumo Final...")
-            summary = synthesize_summary(transcribed_texts)
-            if summary:
-                md_file.write("\n---\n## Resumo Executivo\n\n")
-                md_file.write(summary + "\n")
-
     shutil.rmtree(TEMP_DIR)
     log.info(f"✅ Sucesso! Transcrição salva perfeitamente em: {md_path}")
 

@@ -10,3 +10,4 @@ temp
 
 transcricoes
 models
+.embeddings_*
