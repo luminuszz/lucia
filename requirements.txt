@@ -9,3 +9,4 @@ scipy
 pyannote.audio
 python-dotenv
 transformers<5.0.0
+requests
