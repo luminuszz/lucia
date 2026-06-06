@@ -1,9 +1,11 @@
 venv
+.venv/
 .env
 __pycache__/
 *.pyc
 .DS_Store
 .idea/
+.vscode/
 *.log
 .temp
 temp
@@ -11,3 +13,4 @@ temp
 transcricoes
 models
 .embeddings_*
+.edmundo_*

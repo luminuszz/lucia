@@ -1,4 +1,8 @@
-# 🦁 Aslan (AI Service Language notes)
+<p align="center">
+  <img src="images/image-removebg-preview.png" alt="Aslan Logo" width="300">
+</p>
+
+<h1 align="center">🦁 Aslan (AI Service Language notes)</h1>
 
 O **Aslan** é um ecossistema de inteligência artificial projetado para transformar reuniões, aulas e conversas em conhecimento estruturado e acionável. Integrado diretamente ao seu fluxo de trabalho e ao seu "Segundo Cérebro" (Obsidian), o Aslan automatiza desde a captura de áudio até a gestão de tarefas.
 
