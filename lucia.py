@@ -17,10 +17,12 @@ import numpy as np
 import requests
 import sounddevice as sd
 import torch
-import whisper
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
+from pyannote.audio.pipelines.utils.hook import ProgressHook
 from scipy.io.wavfile import write
+from tqdm import tqdm
 
 # -------------------------------
 # Configurações Globais
@@ -39,7 +41,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Configurações do Ollama Local
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:7b-instruct-q5_K_M"  # Modelo base para 12GB VRAM
+OLLAMA_MODEL = "qwen2.5:7b-instruct-q5_K_M"
 
 os.makedirs(TRANSCRIPTION_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -71,13 +73,12 @@ def synthesize_summary_ollama(transcriptions: list[str]) -> str:
     log.info("Enviando transcrição para o Ollama (%s)...", OLLAMA_MODEL)
 
     prompt = f"""
-    Você é um assistente executivo focado em síntese. Abaixo está a transcrição de uma reunião corporativa.
+    Você é uma assistente executiva focado em síntese, seu nome é Lucia. Abaixo está a transcrição de uma reunião corporativa.
     Seu objetivo é fornecer:
     1. Um resumo executivo de 1 parágrafo.
     2. Os principais tópicos discutidos (em tópicos).
     3. Decisões tomadas.
     4. Pontos de ação (Action Items) com seus respectivos responsáveis (se mencionados).
-    5. Escreva em pt-br (portugues brasileiro)
     Não adicione informações que não estão no texto original.
 
     Transcrição:
@@ -101,7 +102,6 @@ def synthesize_summary_ollama(transcriptions: list[str]) -> str:
 
 
 def summarize_existing_file(filepath: str):
-    """Lê um arquivo .md existente no Obsidian, gera o resumo e anexa ao final."""
     if not os.path.exists(filepath):
         log.error("Arquivo não encontrado: %s", filepath)
         return
@@ -241,7 +241,7 @@ def get_md_filename() -> str:
 
 
 # -------------------------------
-# Processamento Base de IA
+# Processamento Base de IA (Estágios Isolados)
 # -------------------------------
 def assign_speaker_to_segment(start: float, end: float, diarization_result) -> str:
     if hasattr(diarization_result, "speaker_diarization"):
@@ -262,58 +262,90 @@ def assign_speaker_to_segment(start: float, end: float, diarization_result) -> s
 
 
 def process_audio(audio_path: str, md_path: str):
-    """Recebe um arquivo de áudio e faz todo o pipeline de IA (Diarização, Transcrição e Resumo)."""
+    """Executa o pipeline particionado: 1. PyAnnote -> 2. Faster-Whisper -> 3. Ollama."""
     log.info("Iniciando processamento de IA no arquivo: %s", audio_path)
 
-    log.info("Carregando modelos de transcrição/diarização na GPU...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    whisper_model = whisper.load_model(MODEL_NAME, device=device)
+    # ESTÁGIO 1: PyAnnote (Diarização)
+    log.info("🎧 Estágio 1/3: Carregando PyAnnote na GPU...")
     diarization_pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1", token=HF_TOKEN
     )
+    if torch.cuda.is_available():
+        diarization_pipeline.to(torch.device("cuda"))
 
-    log.info("🎧 Processando Diarização (PyAnnote)...")
-    diarization = diarization_pipeline(audio_path)
+    print("\n")  # Quebra de linha para a barra de progresso ficar limpa
+    with ProgressHook() as hook:
+        diarization = diarization_pipeline(audio_path, hook=hook)
+    print("\n")
 
-    log.info("📝 Processando Transcrição (Whisper)... Isso pode levar alguns minutos.")
-    result = whisper_model.transcribe(
-        audio_path,
-        fp16=torch.cuda.is_available(),
-        language=LANGUAGE,
-        task="transcribe",
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        initial_prompt="A seguir, uma gravação de áudio em português contendo uma aula ou reunião.",
-    )
-
-    # Limpeza rigorosa de VRAM
-    log.info("🧹 Liberando a VRAM para o Ollama...")
-    del whisper_model
+    log.info("🧹 Limpando PyAnnote da VRAM...")
     del diarization_pipeline
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    transcribed_texts = []
+    # ESTÁGIO 2: Faster-Whisper (Transcrição)
+    log.info("📝 Estágio 2/3: Carregando Faster-Whisper na GPU...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+
+    whisper_model = WhisperModel(MODEL_NAME, device=device, compute_type=compute_type)
+
+    # O info do faster-whisper nos dá a duração do áudio para podermos montar a barra!
+    segments, info = whisper_model.transcribe(
+        audio_path,
+        language=LANGUAGE,
+        condition_on_previous_text=False,
+        vad_filter=True,
+        initial_prompt="A seguir, uma gravação de áudio em português contendo uma aula ou reunião.",
+    )
 
     log.info("💾 Escrevendo arquivo Markdown para o Segundo Cérebro...")
+    transcribed_texts = []
+
     with open(md_path, "w", encoding="utf-8") as md_file:
         md_file.write(
             f"# Transcrição\n**Data:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n\n"
         )
 
-        for seg in result["segments"]:
-            seg_start, seg_end, text = seg["start"], seg["end"], seg["text"].strip()
-            if not text:
-                continue
+        # Inicia a barra de progresso baseada na duração total do áudio
+        with tqdm(
+            total=round(info.duration, 2),
+            unit="s",
+            desc="📝 Transcrevendo",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}s",
+        ) as pbar:
+            for seg in segments:
+                text = seg.text.strip()
 
-            speaker = assign_speaker_to_segment(seg_start, seg_end, diarization)
-            line = f"[{seg_start:.2f}s - {seg_end:.2f}s] **{speaker}:** {text}"
+                # Atualiza a barra de progresso para acompanhar o término do segmento atual
+                advance = seg.end - pbar.n
+                if advance > 0:
+                    pbar.update(advance)
 
-            md_file.write(line + "\n\n")
-            transcribed_texts.append(text)
+                if not text:
+                    continue
 
-    log.info("🧠 Solicitando resumo executivo via Ollama...")
+                speaker = assign_speaker_to_segment(seg.start, seg.end, diarization)
+                line = f"[{seg.start:.2f}s - {seg.end:.2f}s] **{speaker}:** {text}"
+
+                md_file.write(line + "\n\n")
+                transcribed_texts.append(text)
+
+            # Garante que a barra feche no 100% no final do loop
+            if pbar.n < pbar.total:
+                pbar.update(pbar.total - pbar.n)
+
+    log.info("🧹 Limpando Faster-Whisper da VRAM...")
+    del whisper_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # ESTÁGIO 3: Ollama (Resumo)
+    log.info(
+        "🧠 Estágio 3/3: Solicitando resumo executivo via Ollama... (Isso pode levar alguns minutos)"
+    )
     resumo_ia = synthesize_summary_ollama(transcribed_texts)
 
     with open(md_path, "a", encoding="utf-8") as md_file:
@@ -328,7 +360,6 @@ def process_audio(audio_path: str, md_path: str):
 # Gravação e Processamento Batch
 # -------------------------------
 def batch_transcription():
-    """Responsável exclusivo por gravar o áudio em tempo real e repassar para process_audio."""
     md_path = get_md_filename()
     device_ids, sample_rate = select_input_devices()
 
@@ -416,10 +447,8 @@ def batch_transcription():
     temp_wav_path = os.path.join(TEMP_DIR, "reuniao_completa.wav")
     write(temp_wav_path, sample_rate, (full_audio * 32767).astype(np.int16))
 
-    # ---- CHAMA A NOVA FUNÇÃO DE PROCESSAMENTO ----
     process_audio(temp_wav_path, md_path)
 
-    # Limpa arquivos temporários ao final de todo o processo
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
