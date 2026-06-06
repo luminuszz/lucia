@@ -74,4 +74,5 @@ O projeto preza pela **privacidade e processamento local**:
 ---
 
 ## 📝 Licença
-Este projeto é de uso pessoal. Sinta-se à vontade para adaptar para o seu fluxo.
+
+Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE.md](LICENSE.md) para mais detalhes.
