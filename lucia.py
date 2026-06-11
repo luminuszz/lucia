@@ -5,6 +5,7 @@ import gc
 import logging
 import os
 import queue
+import select
 import shutil
 import subprocess
 import sys
@@ -34,7 +35,10 @@ TRANSCRIPTION_DIR = os.getenv(
     "OBSIDIAN_TRANSCRIPT_DIR",
     "/home/daviribeiro/Documents/obsidian-storage/davi-brain/brain/transcricoes",
 )
-TEMP_DIR = ".temp"
+TEMP_DIR = os.getenv(
+    "OBSIDIAN_TEMP_RAW",
+    "/home/daviribeiro/.temp",
+)
 MODEL_NAME = "medium"
 LANGUAGE = "pt"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -366,10 +370,24 @@ def batch_transcription():
     audio_queues = [queue.Queue() for _ in device_ids]
     stop_event = threading.Event()
 
+    # --- CONFIGURAÇÕES DE AUTO-STOP ---
+    MAX_DURATION_SEC = 40 * 60  # 40 minutos de limite total
+    MAX_SILENCE_SEC = 5 * 60  # 5 minutos contínuos sem áudio para abortar
+    SILENCE_THRESHOLD = 0.015  # Limiar de volume (0.0 a 1.0)
+
+    start_time = time.time()
+    last_audio_time = time.time()
+
     def make_callback(q):
         def callback(indata, frames, time_info, status):
+            nonlocal last_audio_time
             if status:
                 log.debug(f"Aviso de áudio: {status}")
+
+            # Checa se o pico de volume do chunk supera o limiar de silêncio
+            if np.max(np.abs(indata)) > SILENCE_THRESHOLD:
+                last_audio_time = time.time()
+
             q.put(indata.copy())
 
         return callback
@@ -411,10 +429,37 @@ def batch_transcription():
         writer_thread.start()
 
         print("\n" + "=" * 60)
-        input(" 🔴 GRAVANDO... Pressione [ENTER] para parar e processar.")
+        print(" 🔴 GRAVANDO...")
+        print(" 🛑 Pressione [ENTER] para parar e processar manualmente.")
+        print(
+            f" ⏳ Parada automática: {MAX_DURATION_SEC // 60}min total ou {MAX_SILENCE_SEC // 60}min de silêncio."
+        )
         print("=" * 60 + "\n")
 
-        stop_event.set()
+        # --- LOOP DE CONTROLE PRINCIPAL ---
+        while not stop_event.is_set():
+            # 1. Verifica teclado de forma não-bloqueante (timeout de 0.5s)
+            dr, dw, de = select.select([sys.stdin], [], [], 0.5)
+            if dr:
+                sys.stdin.readline()
+                log.info("⏹️ Gravação interrompida manualmente.")
+                stop_event.set()
+                break
+
+            now = time.time()
+
+            # 2. Trava de tempo máximo (40 minutos)
+            if now - start_time >= MAX_DURATION_SEC:
+                log.info("⏰ Limite de 40 minutos atingido. Processando áudio...")
+                stop_event.set()
+                break
+
+            # 3. Trava de inatividade (Silêncio prolongado)
+            if now - last_audio_time >= MAX_SILENCE_SEC:
+                log.info("🔇 Muito tempo sem áudio detectado. Processando áudio...")
+                stop_event.set()
+                break
+
         writer_thread.join()
 
     finally:
